@@ -109,6 +109,7 @@ def _patch_fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
 async def _run_once(
     monkeypatch: pytest.MonkeyPatch,
     streams: list[_FakeStream],
+    session: Any = None,
 ) -> Any:
     _patch_fast_backoff(monkeypatch)
     calls = {"n": 0}
@@ -131,7 +132,7 @@ async def _run_once(
         run_config=cast("RunConfig", object()),
         context={},
         max_turns=5,
-        session=None,
+        session=session,
         interactive=False,
         event_sink=None,
         hooks=None,
@@ -172,3 +173,75 @@ async def test_run_cycle_does_not_retry_permanent_error(
     streams = [_FakeStream(exc=bad_request), _FakeStream()]
     with pytest.raises(BadRequestError):
         await _run_once(monkeypatch, streams)
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "expected"),
+    [
+        (
+            404,
+            "litellm.NotFoundError: NotFoundError: OpenrouterException - "
+            '{"error":{"message":"No endpoints found that support image input","code":404,'
+            '"metadata":{"failed_routing_step":"Filter by Image Support"}}}',
+            True,
+        ),
+        (400, "Invalid content type. image_url is only supported by certain models.", True),
+        (400, "my-model is not a multimodal model", True),
+        (400, "This model doesn't support the image field for user messages.", True),
+        (422, "messages[3]: unknown variant `image_url`, expected `text`", True),
+        (400, "'Image URLs in user messages' functionality not supported.", True),
+        (
+            400,
+            "OpenRouterException: Message: This model's maximum context length is 1048576 "
+            "tokens, but the request requires 1073484 tokens (942412 input including "
+            "image/vision expansion + 131072 for the completion). Reduce the input length "
+            "or max_tokens.",
+            False,
+        ),
+        (400, "At most 5 image(s) may be provided in one prompt.", False),
+        (
+            400,
+            "Upstream error from Relace: Generation stopped with an incomplete tool call",
+            False,
+        ),
+        (500, "No endpoints found that support image input", False),
+    ],
+)
+def test_is_image_rejection(status: int, message: str, expected: bool) -> None:
+    exc = APIStatusError(message, response=httpx.Response(status, request=_request()), body=None)
+    assert execution._is_image_rejection(exc) is expected
+
+
+async def _run_with_image_session(
+    monkeypatch: pytest.MonkeyPatch, streams: list[_FakeStream]
+) -> tuple[Any, int, int]:
+    strips = {"n": 0}
+
+    async def _fake_strip(_session: Any) -> bool:
+        strips["n"] += 1
+        return True
+
+    async def _no_compact(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(execution, "strip_all_images_from_session", _fake_strip)
+    monkeypatch.setattr(execution, "_compact_session", _no_compact)
+    result, attempts, _coordinator = await _run_once(monkeypatch, streams, session=object())
+    return result, attempts, strips["n"]
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_strips_images_on_image_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejection = APIStatusError(
+        "No endpoints found that support image input",
+        response=httpx.Response(status_code=404, request=_request()),
+        body=None,
+    )
+    streams = [_FakeStream(exc=rejection), _FakeStream()]
+    result, attempts, strips = await _run_with_image_session(monkeypatch, streams)
+
+    assert result is streams[1]
+    assert attempts == 2
+    assert strips == 1

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
@@ -57,6 +58,18 @@ logger = logging.getLogger(__name__)
 StreamEventSink = Callable[[str, Any], None]
 
 _INPUT_REJECTION_CODES = frozenset({400, 404, 422})
+# Replies meaning "this model takes no images", not image errors in general: a
+# context overflow that counts "image/vision expansion" must not match.
+_IMAGE_REJECTION = re.compile(
+    r"no endpoints found that support image input"  # OpenRouter
+    r"|image_url is only supported by certain models"  # OpenAI
+    r"|is not a multimodal model|at most 0 image\(s\)"  # vLLM
+    r"|does not support image input"  # LiteLLM's Fireworks check
+    r"|doesn't support the image field"  # Bedrock Converse
+    r"|unknown variant `image_url`"  # DeepSeek, e.g. via Vercel AI Gateway
+    r"|'[^']*image[^']*' functionality not supported",  # Vercel AI Gateway (AI SDK), unverified
+    re.IGNORECASE,
+)
 _MAX_COMPACTIONS_PER_CYCLE = 2
 
 
@@ -154,6 +167,12 @@ _TRANSIENT_MODEL_RETRY_MAX_DELAY_S = 90.0
 def _model_error_status_code(exc: BaseException) -> int | None:
     code = getattr(exc, "status_code", None)
     return code if isinstance(code, int) else None
+
+
+def _is_image_rejection(exc: BaseException) -> bool:
+    return _model_error_status_code(exc) in _INPUT_REJECTION_CODES and bool(
+        _IMAGE_REJECTION.search(str(exc))
+    )
 
 
 def _is_transient_model_error(exc: BaseException) -> bool:
@@ -831,11 +850,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             await coordinator.trigger_budget_stop()
             raise
         except Exception as exc:
-            if (
-                image_strips < 3
-                and session is not None
-                and getattr(exc, "status_code", None) in _INPUT_REJECTION_CODES
-            ):
+            if image_strips < 3 and session is not None and _is_image_rejection(exc):
                 try:
                     stripped = await strip_all_images_from_session(session)
                 except Exception:
